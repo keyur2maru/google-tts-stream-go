@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>TTS WebSocket Stream with AudioWorklet</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 20px auto;
+      padding: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      background-color: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    textarea {
+      width: 100%;
+      height: 100px;
+      margin: 10px 0;
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      resize: vertical;
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    select, button {
+      padding: 8px 16px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background-color: white;
+    }
+    button {
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #45a049;
+    }
+    button:disabled {
+      background-color: #cccccc;
+      cursor: not-allowed;
+    }
+    #status {
+      margin-top: 20px;
+      padding: 10px;
+      border-radius: 4px;
+    }
+    .connected {
+      background-color: #dff0d8;
+      color: #3c763d;
+    }
+    .disconnected {
+      background-color: #f2dede;
+      color: #a94442;
+    }
+    #debugInfo {
+      margin-top: 10px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Text-to-Speech Streaming Demo</h1>
+  <div id="status" class="disconnected">Status: Disconnected</div>
+  
+  <div class="controls">
+    <select id="voice">
+      <option value="en-US-Journey-D">English US</option>
+    </select>
+    <select id="language">
+      <option value="en-US">English (US)</option>
+    </select>
+  </div>
+
+  <textarea id="text" placeholder="Enter text to convert to speech...">Hello! This is a test of the WebSocket-based text-to-speech streaming system.</textarea>
+  
+  <button id="speak" onclick="startSpeaking()" disabled>Speak</button>
+  <div id="debugInfo"></div>
+</div>
+
+<script>
+  let ws;
+  let audioContext;
+  let audioWorkletNode;
+  let initialized = false;
+
+  async function initAudio() {
+    if (initialized) return;
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 24000
+    });
+
+    // Load and register our audio worklet
+    await audioContext.audioWorklet.addModule('audio-processor.js');
+    
+    // Create audio worklet node
+    audioWorkletNode = new AudioWorkletNode(audioContext, 'tts-audio-processor');
+    audioWorkletNode.connect(audioContext.destination);
+    
+    initialized = true;
+    updateDebugInfo('Audio system initialized');
+  }
+
+  function updateDebugInfo(message) {
+    const debugDiv = document.getElementById('debugInfo');
+    const timestamp = new Date().toLocaleTimeString();
+    debugDiv.innerHTML += `[${timestamp}] ${message}<br>`;
+    debugDiv.scrollTop = debugDiv.scrollHeight;
+  }
+
+  function connect() {
+    ws = new WebSocket('wss://localhost:8086/ws');
+    
+    ws.onopen = () => {
+      document.getElementById('status').className = 'connected';
+      document.getElementById('status').textContent = 'Status: Connected';
+      document.getElementById('speak').disabled = false;
+      updateDebugInfo('WebSocket connected');
+    };
+    
+    ws.onclose = () => {
+      document.getElementById('status').className = 'disconnected';
+      document.getElementById('status').textContent = 'Status: Disconnected';
+      document.getElementById('speak').disabled = true;
+      updateDebugInfo('WebSocket disconnected, retrying in 3s...');
+      setTimeout(connect, 3000);
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      updateDebugInfo('WebSocket error: ' + error);
+    };
+
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = handleMessage;
+  }
+
+  async function startSpeaking() {
+    await initAudio();
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    const text = document.getElementById('text').value;
+    const voice = document.getElementById('voice').value;
+    const lang = document.getElementById('language').value;
+    if (!text) return;
+
+    updateDebugInfo('Starting new TTS request');
+
+    // Send TTS request
+    ws.send(JSON.stringify({
+      text: text,
+      voice: voice,
+      lang: lang
+    }));
+
+    document.getElementById('speak').disabled = true;
+  }
+
+  async function handleMessage(event) {
+    if (typeof event.data === 'string') {
+      try {
+        const message = JSON.parse(event.data);
+        switch (message.type) {
+          case 'start':
+            updateDebugInfo('Received start signal');
+            break;
+          case 'end':
+            updateDebugInfo('Streaming complete');
+            document.getElementById('speak').disabled = false;
+            break;
+          case 'error':
+            updateDebugInfo('Error: ' + message.error);
+            document.getElementById('speak').disabled = false;
+            break;
+        }
+      } catch (err) {
+        console.error('Failed to parse JSON message:', err);
+        updateDebugInfo('Error parsing message: ' + err.message);
+      }
+    } else if (event.data instanceof ArrayBuffer) {
+      try {
+        const arrayBuffer = event.data;
+        const uint8Array = new Uint8Array(arrayBuffer);
+        const floatData = new Float32Array(uint8Array.length / 2);
+
+        // Convert headerless LINEAR16 audio with a sample rate of 24000 Hz to PCM array Int16
+        for (let i = 0; i < uint8Array.length; i += 2) {
+          const int16 = uint8Array[i + 1] << 8 | uint8Array[i];
+          floatData[i / 2] = int16 / 32768.0;
+        }
+
+        if (floatData.length > 0) {
+          // Send audio data to the worklet
+          audioWorkletNode.port.postMessage({
+            type: 'audio',
+            audioData: floatData
+          });
+          updateDebugInfo(`Processed ${floatData.length} samples`);
+        }
+      } catch (error) {
+        console.error('Error processing audio data:', error);
+        updateDebugInfo('Error processing audio: ' + error.message);
+      }
+    }
+  }
+
+  window.addEventListener('load', () => {
+    connect();
+    updateDebugInfo('Page loaded, connecting to WebSocket...');
+  });
+</script>
+</body>
+</html>
