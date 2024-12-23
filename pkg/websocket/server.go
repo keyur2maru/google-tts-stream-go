@@ -94,43 +94,63 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn: wsConn,
 	}
 
+	logger.Debugf("[WS][%s] New WebSocket connection established", conn.id)
+
 	// Register connection
 	s.mu.Lock()
 	s.conns[conn.id] = conn
 	s.mu.Unlock()
 
+	logger.Debugf("[WS][%s] Connection registered", conn.id)
+
 	// Ensure cleanup on disconnect
 	defer func() {
+		logger.Debugf("[WS][%s] Connection closing, cleaning up", conn.id)
 		s.mu.Lock()
 		delete(s.conns, conn.id)
 		s.mu.Unlock()
 		wsConn.Close()
 		s.ttsService.CloseSession(conn.id)
+		logger.Debugf("[WS][%s] Cleanup completed", conn.id)
 	}()
 
 	// Handle the first message to initialize the stream
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil {
-		logger.Errorf("Failed to read initial message: %v", err)
+		logger.Errorf("[WS][%s] Failed to read initial message: %v", conn.id, err)
 		return
 	}
 
+	logger.Debugf("[WS][%s] Received initial message: %s", conn.id, string(msg))
+
 	var req TTSRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
+		logger.Errorf("[WS][%s] Failed to parse initial message: %v", conn.id, err)
 		s.sendError(conn, "Invalid initial request format")
 		return
 	}
 
 	// Create TTS session
 	ctx := context.Background()
+	logger.Debugf("[WS][%s] Creating TTS session with voice=%s, lang=%s",
+		conn.id, req.Voice, req.Lang)
+
 	if err := s.ttsService.CreateSession(ctx, conn.id, req.Voice, req.Lang); err != nil {
+		logger.Errorf("[WS][%s] Failed to create TTS session: %v", conn.id, err)
 		s.sendError(conn, fmt.Sprintf("Failed to create TTS session: %v", err))
+		return
+	}
+
+	if err := s.ttsService.SynthesizeText(conn.id, req.Text); err != nil {
+		logger.Errorf("[WS][%s] Failed to synthesize initial text: %v", conn.id, err)
+		s.sendError(conn, fmt.Sprintf("Failed to synthesize text: %v", err))
 		return
 	}
 
 	// Get audio channel
 	audioChan, errChan, err := s.ttsService.GetAudioChannel(conn.id)
 	if err != nil {
+		logger.Errorf("[WS][%s] Failed to get audio channel: %v", conn.id, err)
 		s.sendError(conn, fmt.Sprintf("Failed to get audio channel: %v", err))
 		return
 	}
@@ -143,28 +163,37 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Type:   "start",
 		Status: "ready",
 	}); err != nil {
-		logger.Errorf("Failed to send start message: %v", err)
+		logger.Errorf("[WS][%s] Failed to send start message: %v", conn.id, err)
 		return
 	}
+
+	logger.Debugf("[WS][%s] Initial setup complete, entering message loop", conn.id)
 
 	// Handle incoming messages
 	for {
 		_, msg, err := wsConn.ReadMessage()
 		if err != nil {
-			if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logger.Errorf("Error reading message: %v", err)
+			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				logger.Debugf("[WS][%s] WebSocket closed normally", conn.id)
+			} else {
+				logger.Errorf("[WS][%s] Error reading message: %v", conn.id, err)
 			}
 			break
 		}
 
+		logger.Debugf("[WS][%s] Received message: %s", conn.id, string(msg))
+
 		var req TTSRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
+			logger.Errorf("[WS][%s] Failed to parse message: %v", conn.id, err)
 			s.sendError(conn, "Invalid request format")
 			continue
 		}
 
 		// Send text to existing stream
+		logger.Debugf("[WS][%s] Synthesizing text: %q", conn.id, req.Text)
 		if err := s.ttsService.SynthesizeText(conn.id, req.Text); err != nil {
+			logger.Errorf("[WS][%s] Failed to synthesize text: %v", conn.id, err)
 			s.sendError(conn, fmt.Sprintf("Failed to synthesize text: %v", err))
 			continue
 		}
@@ -172,21 +201,34 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamAudio(conn *Connection, audioChan <-chan []byte, errChan <-chan error) {
+	logger.Debugf("[WS][%s] Starting audio streaming", conn.id)
+	audioChunks := 0
+	totalBytes := 0
+
 	for {
 		select {
 		case audioData, ok := <-audioChan:
 			if !ok {
+				logger.Debugf("[WS][%s] Audio channel closed. Total chunks: %d, Total bytes: %d",
+					conn.id, audioChunks, totalBytes)
 				return
 			}
+			audioChunks++
+			totalBytes += len(audioData)
+			logger.Debugf("[WS][%s] Sending audio chunk %d: %d bytes",
+				conn.id, audioChunks, len(audioData))
+
 			if err := conn.WriteMessage(websocket.BinaryMessage, audioData); err != nil {
-				logger.Errorf("Failed to send audio data: %v", err)
+				logger.Errorf("[WS][%s] Failed to send audio data: %v", conn.id, err)
 				return
 			}
 
 		case err, ok := <-errChan:
 			if !ok {
+				logger.Debugf("[WS][%s] Error channel closed", conn.id)
 				return
 			}
+			logger.Errorf("[WS][%s] TTS error: %v", conn.id, err)
 			s.sendError(conn, fmt.Sprintf("TTS error: %v", err))
 			return
 		}
@@ -194,12 +236,13 @@ func (s *Server) streamAudio(conn *Connection, audioChan <-chan []byte, errChan 
 }
 
 func (s *Server) sendError(conn *Connection, message string) {
+	logger.Errorf("[WS][%s] Sending error: %s", conn.id, message)
 	resp := TTSResponse{
 		Type:  "error",
 		Error: message,
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		logger.Errorf("Failed to send error message: %v", err)
+		logger.Errorf("[WS][%s] Failed to send error message: %v", conn.id, err)
 	}
 }
 
